@@ -1,16 +1,17 @@
-# Usa una imagen base de Python
-FROM python:3.12-slim
+# Usar una imagen base de Python
+FROM python:3.9-slim
 
-# Establecer el directorio de trabajo en el contenedor
+# Establecer el directorio de trabajo
 WORKDIR /app
 
-# Copiar el archivo de código fuente al contenedor
-COPY . /app
+# Copiar los archivos del servidor al contenedor
+COPY . .
 
+# Instalar las dependencias necesarias
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Exponer el puerto que utilizará el servidor (65432 por defecto)
+# Exponer el puerto del servidor
 EXPOSE 65432
 
-# Comando para ejecutar la aplicación
-CMD ["python", "app.py"]
+# Comando para iniciar el servidor
+CMD ["python", "server.py"]

@@ -1,103 +1,118 @@
+import logging
+from flask import Flask, render_template, request, jsonify
 import socket
 import json
-import logging
 import os
-import time
-from azure.eventhub import EventHubProducerClient, EventData
-from azure.identity import DefaultAzureCredential
-from azure.mgmt.containerinstance import ContainerInstanceManagementClient
 from dotenv import load_dotenv
+from azure.eventhub import EventHubProducerClient, EventData
 
-# Cargar variables desde el archivo .env
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+
+# Cargar variables de entorno
 load_dotenv()
 
-# Variables de entorno
+# Configuración de Event Hub
 EVENT_HUB_CONNECTION_STRING = os.getenv("EVENT_HUB_CONNECTION_STRING")
 EVENT_HUB_NAME = os.getenv("EVENT_HUB_NAME")
-RESOURCE_GROUP = os.getenv("RESOURCE_GROUP")
-CONTAINER_NAME = os.getenv("CONTAINER_NAME")
-SUBSCRIPTION_ID = os.getenv("SUBSCRIPTION_ID")
+if not EVENT_HUB_CONNECTION_STRING or not EVENT_HUB_NAME:
+    logging.critical("Las variables EVENT_HUB_CONNECTION_STRING y EVENT_HUB_NAME son obligatorias.")
+    exit(1)
 
-# Configuración del servidor socket
-HOST = os.getenv("HOST")
-PORT = int(os.getenv("PORT"))
+# Configuración del servidor de datos
+SERVER_HOST = os.getenv("HOST")
+SERVER_PORT = os.getenv("PORT")
+if not SERVER_HOST or not SERVER_PORT:
+    logging.critical("Las variables HOST y PORT son obligatorias.")
+    exit(1)
+
+SERVER_PORT = int(SERVER_PORT)
+
+# Inicializar Flask
+app = Flask(__name__)
+
+# Crear una única instancia del cliente de Event Hub
+producer = EventHubProducerClient.from_connection_string(
+    conn_str=EVENT_HUB_CONNECTION_STRING,
+    eventhub_name=EVENT_HUB_NAME
+)
+
+# Función para enviar datos a Event Hub
+def send_to_event_hub(data, retries=3):
+    for attempt in range(1, retries + 1):
+        try:
+            logging.info(f"Intentando enviar datos a Event Hub (intento {attempt}/{retries})...")
+            # Obtener el car_id como partition_key
+            partition_key = data.get("car_id")
+            if not partition_key:
+                raise ValueError("El campo 'car_id' es obligatorio para la partition_key")
+
+            # Crear el evento con los datos
+            event_data = EventData(json.dumps(data))
+            producer.send_batch([event_data], partition_key=partition_key)
+            logging.info(f"Datos enviados a Event Hub con partition_key '{partition_key}': {data}")
+            return  # Salir del bucle si el envío fue exitoso
+
+        except Exception as e:
+            logging.error(f"Error enviando datos a Event Hub (intento {attempt}/{retries}): {e}")
+            if attempt == retries:
+                logging.critical("Se agotaron los reintentos. Los datos no pudieron enviarse.")
+                raise
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
-    logging.info(HOST)
-    logging.info("Starting continuous socket client in ACI...")
 
+# Ruta principal
+@app.route('/')
+def index():
+    logging.info("Accediendo a la página principal")
+    return render_template('index.html')
+
+# Ruta para iniciar trayecto
+@app.route('/start', methods=['POST'])
+def start_trayecto():
+    data = request.json
+    trayecto = data.get('trayecto')
+    if not trayecto:
+        logging.error("No se proporcionó el campo 'trayecto' en la solicitud.")
+        return jsonify({"error": "El campo 'trayecto' es obligatorio"}), 400
+
+    logging.info(f"Inicio del trayecto recibido: {trayecto}")
     try:
+        logging.info(f"Conectando al servidor de datos en {SERVER_HOST}:{SERVER_PORT}...")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
-            client_socket.connect((HOST, PORT))
-            logging.info(f"Connected to server at {HOST}:{PORT}")
+            client_socket.connect((SERVER_HOST, SERVER_PORT))
+            logging.info(f"Conexión establecida con el servidor de datos.")
 
-            logging.info(client_socket)
+            request_data = json.dumps({"trayecto": trayecto})
+            client_socket.sendall(request_data.encode('utf-8'))
+            logging.info(f"Datos del trayecto enviados al servidor: {request_data}")
+
             while True:
-                # Enviar el comando "NEXT"
-                command = "NEXT"
-                client_socket.sendall(command.encode('utf-8'))
-
-                # Recibir respuesta
-                data = client_socket.recv(1024)
-                logging.info(f"Data: {data}")
-                response = json.loads(data.decode('utf-8'))
-                logging.info(f"Response from server: {response}")
-
-                # Verificar si el servidor respondió con un error
-                if isinstance(response, dict) and response.get("status") == 400:
-                    logging.error("Server responded with status 400. Shutting down container.")
-                    stop_container()
+                response = client_socket.recv(1024)
+                if not response:
+                    logging.info("No se recibieron más datos del servidor. Finalizando conexión.")
                     break
+                response_data = json.loads(response.decode('utf-8'))
+                logging.info(f"Datos recibidos del servidor: {response_data}")
+                send_to_event_hub(response_data)
 
-                # Enviar datos al Event Hub
-                send_to_event_hub(response)
-
-                # Evitar sobrecargar el servidor
-                time.sleep(1)
-
+            return jsonify({"message": f"Datos del trayecto '{trayecto}' enviados a Event Hub"})
     except Exception as e:
-        logging.error(f"Error in continuous socket client: {e}")
+        logging.error(f"Error procesando el trayecto: {e}")
+        return jsonify({"error": str(e)}), 500
 
+# Cerrar el cliente de Event Hub al finalizar
+@app.teardown_appcontext
+def close_eventhub_client(exception=None):
+    if producer:
+        logging.info("Cerrando cliente de Event Hub...")
+        producer.close()
 
-def send_to_event_hub(data: dict):
-    """
-    Enviar datos al Event Hub.
-    """
-    try:
-        producer = EventHubProducerClient.from_connection_string(
-            conn_str=EVENT_HUB_CONNECTION_STRING,
-            eventhub_name=EVENT_HUB_NAME
-        )
-        with producer:
-            partition_key = str(data.get('car_id'))  # Usar el user_id como partitionKey
-            # Crear un lote de eventos
-            event_data_batch = producer.create_batch(partition_key=partition_key)
-            # Añadir el evento (convertir a cadena JSON)
-            event_data_batch.add(EventData(json.dumps(data)))
-
-            # Enviar el lote con el partition_key
-            producer.send_batch(event_data_batch)
-            logging.info("Data sent to Event Hub successfully.")
-    except Exception as e:
-        logging.error(f"Error sending data to Event Hub: {e}")
-
-
-def stop_container():
-    """
-    Detener el contenedor de Azure Container Instances.
-    """
-    try:
-        # Autenticación con Azure
-        credential = DefaultAzureCredential()
-        client = ContainerInstanceManagementClient(credential, SUBSCRIPTION_ID)
-
-        # Detener el contenedor
-        client.containers.stop(resource_group_name=RESOURCE_GROUP, container_group_name=CONTAINER_NAME)
-        logging.info(f"Container {CONTAINER_NAME} stopped successfully.")
-    except Exception as e:
-        logging.error(f"Error stopping container: {e}")
-
-if __name__ == "__main__":
-    main()
+# Ejecutar Flask
+if __name__ == '__main__':
+    logging.info("Iniciando la aplicación Flask...")
+    app.run(host='0.0.0.0', port=5000)
